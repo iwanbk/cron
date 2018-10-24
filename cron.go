@@ -1,27 +1,37 @@
 // Package cron implements a cron spec parser and runner.
-package cron // import "gopkg.in/robfig/cron.v2"
+package cron
 
 import (
+	"context"
+	"errors"
 	"sort"
+	"sync"
 	"time"
+)
+
+var (
+	// ErrWaitTimeout returned when it timed out on WaitStop
+	ErrWaitTimeout = errors.New("wait timed out")
 )
 
 // Cron keeps track of any number of entries, invoking the associated func as
 // specified by the schedule. It may be started, stopped, and the entries may
 // be inspected while running.
 type Cron struct {
-	entries  []*Entry
-	stop     chan struct{}
-	add      chan *Entry
-	remove   chan EntryID
-	snapshot chan []Entry
-	running  bool
-	nextID   EntryID
+	entries   []*Entry
+	add       chan *Entry
+	remove    chan EntryID
+	snapshot  chan []Entry
+	running   bool
+	nextID    EntryID
+	ctx       context.Context
+	cancel    context.CancelFunc
+	waitGroup sync.WaitGroup
 }
 
 // Job is an interface for submitted cron jobs.
 type Job interface {
-	Run()
+	Run(context.Context)
 }
 
 // Schedule describes a job's duty cycle.
@@ -78,23 +88,25 @@ func (s byTime) Less(i, j int) bool {
 
 // New returns a new Cron job runner.
 func New() *Cron {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Cron{
 		entries:  nil,
 		add:      make(chan *Entry),
-		stop:     make(chan struct{}),
 		snapshot: make(chan []Entry),
 		remove:   make(chan EntryID),
 		running:  false,
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 }
 
 // FuncJob is a wrapper that turns a func() into a cron.Job
-type FuncJob func()
+type FuncJob func(context.Context)
 
-func (f FuncJob) Run() { f() }
+func (f FuncJob) Run(ctx context.Context) { f(ctx) }
 
 // AddFunc adds a func to the Cron to be run on the given schedule.
-func (c *Cron) AddFunc(spec string, cmd func()) (EntryID, error) {
+func (c *Cron) AddFunc(spec string, cmd func(context.Context)) (EntryID, error) {
 	return c.AddJob(spec, FuncJob(cmd))
 }
 
@@ -186,7 +198,12 @@ func (c *Cron) run() {
 				if e.Next != effective {
 					break
 				}
-				go e.Job.Run()
+				go func(e *Entry) {
+					c.waitGroup.Add(1)
+					defer c.waitGroup.Done()
+
+					e.Job.Run(c.ctx)
+				}(e)
 				e.Prev = e.Next
 				e.Next = e.Schedule.Next(effective)
 			}
@@ -202,7 +219,7 @@ func (c *Cron) run() {
 		case id := <-c.remove:
 			c.removeEntry(id)
 
-		case <-c.stop:
+		case <-c.ctx.Done():
 			return
 		}
 
@@ -212,8 +229,29 @@ func (c *Cron) run() {
 
 // Stop the cron scheduler.
 func (c *Cron) Stop() {
-	c.stop <- struct{}{}
+	c.cancel()
 	c.running = false
+}
+
+// StopWait stops the cron scheduler
+// and wait for all the running job to be finished.
+// timeout is duration for how long we want to wait.
+func (c *Cron) StopWait(timeout time.Duration) error {
+	c.Stop()
+
+	finished := make(chan struct{}, 1)
+	go func() {
+		c.waitGroup.Wait()
+		finished <- struct{}{}
+	}()
+
+	select {
+	case <-time.After(timeout):
+		return ErrWaitTimeout
+	case <-finished:
+		// do nothing
+	}
+	return nil
 }
 
 // entrySnapshot returns a copy of the current cron entry list.
